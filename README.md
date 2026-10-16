@@ -33,6 +33,14 @@ Validated on *Counter-Strike 2* (Source 2 Engine) Benchmark Map across 20,000+ f
 
 > **Key Takeaway:** The **Balanced Mode** achieved a **+9.57% Average FPS boost** (from 209.0 to 229.0 FPS) while completely eliminating frametime outliers (**0 Excluded Frames** out of \~30,000 frames rendered), proving zero thread preemption during active gameplay.
 
+
+![Görsel Açıklaması](docs/fps_benchmark.png)
+![Görsel Açıklaması](docs/excluded_frames.png)
+
+
+
+
+
 ## 🏗️ System Architecture & Engineering Methods
 
 ```
