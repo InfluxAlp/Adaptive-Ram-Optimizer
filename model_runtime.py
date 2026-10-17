@@ -1,4 +1,5 @@
 import pandas as pd
+from dataclasses import dataclass
 
 
 FEATURE_COLUMNS = [
@@ -7,6 +8,14 @@ FEATURE_COLUMNS = [
     "accumulated_fg_sec", "accumulated_bg_sec", "focus_ratio",
     "ram_percent",
 ]
+
+
+@dataclass
+class RuntimeTelemetry:
+    high_promotions_count: int = 0
+    priority_resets_count: int = 0
+    ram_trims_count: int = 0
+    accumulated_suppression_mb: float = 0.0
 
 
 def predict_candidates(model, rows):

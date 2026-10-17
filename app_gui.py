@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QFont, QFontDatabase, QColor
 
-from model_runtime import predict_candidates
+from model_runtime import RuntimeTelemetry, predict_candidates
 from training_worker import AutoTrainWorker
 from optimizer_core import OptimizerCore
 
@@ -341,6 +341,11 @@ class EventDrivenTelemetryWorker(QThread):
         self._last_optimization_at = 0.0
         self._lowered_priority_pids = set()
         self._event_count = 0
+        self._runtime = RuntimeTelemetry()
+        self._focus_started_at = None
+        self._active_focus_name = "-"
+        self._active_focus_pid = 0
+        self._last_dashboard_data = {}
         self.load_ml_model()
 
     def load_ml_model(self):
@@ -407,6 +412,8 @@ class EventDrivenTelemetryWorker(QThread):
                     optimized_count += 1
                 if reduction is not None:
                     released_memory_mb += reduction
+                    self._runtime.ram_trims_count += 1
+                    self._runtime.accumulated_suppression_mb += reduction
                     self._last_trim_times[pid] = time.monotonic()
                 if priority_changed:
                     self._lowered_priority_pids.add(pid)
@@ -418,6 +425,7 @@ class EventDrivenTelemetryWorker(QThread):
             f"Manuel optimizasyon: {optimized_count} süreç işlendi, "
             f"{released_memory_mb:.2f} MB RAM azaltıldı."
         )
+        self.data_updated.emit(self._runtime_data())
         self.manual_optimization_finished.emit(optimized_count, released_memory_mb)
 
     def _log(self, message):
@@ -498,12 +506,41 @@ class EventDrivenTelemetryWorker(QThread):
                 if isinstance(event, tuple) and event[0] == "manual_optimization":
                     self._run_manual_optimization()
                     continue
+                if event.event_status == 2:
+                    self._runtime.priority_resets_count += 1
+                    self._log(
+                        f"[DEMOTION] PID {event.process_id} reverted to NORMAL."
+                    )
+                    self.data_updated.emit(self._runtime_data())
+                    continue
+                if event.event_status == 3:
+                    self._log(
+                        f"[ABORT] Focus lost from PID {event.process_id} "
+                        "before 2s evaluation. Debounce timer cancelled."
+                    )
+                    continue
+                if event.event_status == 1:
+                    self._runtime.high_promotions_count += 1
+                    self._log(
+                        f"[PROMOTION] {event.process_name or 'Unknown'} "
+                        f"(PID {event.process_id}) sustained focus confirmed (2.0s). "
+                        "Set to HIGH_PRIORITY_CLASS."
+                    )
+                    self.data_updated.emit(self._runtime_data())
+                    continue
                 if self.collection_paused:
                     continue
                 self._event_count += 1
 
                 process_name = event.process_name or "Unknown"
                 title = event.window_title
+                self._active_focus_name = process_name
+                self._active_focus_pid = event.process_id
+                self._focus_started_at = time.monotonic()
+                self._log(
+                    f"[EVENT] Focus changed to: {process_name} "
+                    f"(PID {event.process_id}). ARMING 2s evaluation timer."
+                )
                 now_monotonic = time.monotonic()
                 if (
                     process_name == self._last_processed_process
@@ -666,6 +703,8 @@ class EventDrivenTelemetryWorker(QThread):
                         if reduction is not None:
                             optimized_count += 1
                             released_memory_mb += reduction
+                            self._runtime.ram_trims_count += 1
+                            self._runtime.accumulated_suppression_mb += reduction
                             self._last_trim_times[pid] = now_monotonic
                             self._log(
                                 f"Bellek temizlendi: PID {pid}, "
@@ -679,7 +718,7 @@ class EventDrivenTelemetryWorker(QThread):
                             self._log(f"Öncelik düşürüldü: PID {pid}")
                     self._last_optimization_at = now_monotonic
                 connection.commit()
-                self.data_updated.emit({
+                dashboard_data = {
                     "fg_name": process_name,
                     "fg_title": title,
                     "active_pid": event.process_id,
@@ -696,7 +735,10 @@ class EventDrivenTelemetryWorker(QThread):
                     "predicted_next": (
                         predicted_next
                     ),
-                })
+                    **self._runtime_data(),
+                }
+                self._last_dashboard_data = dashboard_data
+                self.data_updated.emit(dashboard_data)
         except OSError as error:
             print(f"Event-driven telemetry core unavailable: {error}")
         finally:
@@ -704,6 +746,27 @@ class EventDrivenTelemetryWorker(QThread):
                 self._core.stop()
                 self._core = None
             connection.close()
+
+    def _runtime_data(self):
+        runtime = {
+            **self._last_dashboard_data,
+            "high_promotions_count": self._runtime.high_promotions_count,
+            "priority_resets_count": self._runtime.priority_resets_count,
+            "ram_trims_count": self._runtime.ram_trims_count,
+            "accumulated_suppression_mb": self._runtime.accumulated_suppression_mb,
+            "focus_started_at": self._focus_started_at,
+            "active_focus_name": self._active_focus_name,
+            "active_focus_pid": self._active_focus_pid,
+        }
+        runtime.update({
+            "fg_name": runtime.get("fg_name", self._active_focus_name),
+            "fg_title": runtime.get("fg_title", ""),
+            "active_pid": runtime.get("active_pid", self._active_focus_pid),
+            "ram_percent": runtime.get("ram_percent", 0),
+            "used_ram_mb": runtime.get("used_ram_mb", 0),
+            "candidates_count": runtime.get("candidates_count", 0),
+        })
+        return runtime
 
 
 class RamOptimizerApp(QMainWindow):
@@ -733,6 +796,7 @@ class RamOptimizerApp(QMainWindow):
         self.worker = EventDrivenTelemetryWorker(db_path=self.db_path, model_path=self.model_path)
         self.worker.set_optimization_mode(self.optimization_mode)
         self.worker.data_updated.connect(self.update_dashboard)
+        self.worker.telemetry_log.connect(self.append_telemetry_log)
         self.worker.manual_optimization_finished.connect(self.on_manual_optimization_finished)
         self.worker.start()
 
@@ -743,6 +807,9 @@ class RamOptimizerApp(QMainWindow):
         self.telemetry_dialog = None
         self.telemetry_log_view = None
         self.telemetry_timer = None
+        self.focus_timer = QTimer(self)
+        self.focus_timer.timeout.connect(self.update_focus_clock)
+        self.focus_timer.start(500)
         self.apply_language()
 
         # Start the first background training run.
@@ -1055,6 +1122,7 @@ class RamOptimizerApp(QMainWindow):
         self.worker = EventDrivenTelemetryWorker(db_path=self.db_path, model_path=self.model_path)
         self.worker.set_optimization_mode(self.optimization_mode)
         self.worker.data_updated.connect(self.update_dashboard)
+        self.worker.telemetry_log.connect(self.append_telemetry_log)
         self.worker.manual_optimization_finished.connect(self.on_manual_optimization_finished)
         self.worker.start()
         self.btn_collection.setText(self.t("pause_collection"))
@@ -1063,7 +1131,7 @@ class RamOptimizerApp(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle(self.t("title"))
-        self.setFixedSize(620, 680)
+        self.setFixedSize(760, 860)
 
         font_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeui.ttf")
         font_id = QFontDatabase.addApplicationFont(font_path)
@@ -1134,6 +1202,34 @@ class RamOptimizerApp(QMainWindow):
         layout1.addWidget(self.lbl_mode)
         layout1.addWidget(self.lbl_prediction)
         main_layout.addWidget(frame1)
+
+        telemetry_frame = QWidget()
+        telemetry_frame.setObjectName("infoCard")
+        telemetry_layout = QVBoxLayout(telemetry_frame)
+        telemetry_layout.setContentsMargins(10, 8, 10, 8)
+        telemetry_layout.setSpacing(3)
+        self.lbl_sustained_focus = QLabel("Hold: - (0.0s of 2.0s threshold)")
+        self.lbl_sustained_focus.setStyleSheet("color: #65a2df; font-weight: bold;")
+        self.lbl_promotions = QLabel("Promoted Apps: 0")
+        self.lbl_resets = QLabel("Priority Resets: 0")
+        self.lbl_trims = QLabel("RAM Trims: 0 triggers | 0.0 MB Freed")
+        for label in (self.lbl_sustained_focus, self.lbl_promotions,
+                      self.lbl_resets, self.lbl_trims):
+            label.setMinimumHeight(18)
+            telemetry_layout.addWidget(label)
+        main_layout.addWidget(telemetry_frame)
+
+        self.dashboard_log_view = QTextEdit()
+        self.dashboard_log_view.setReadOnly(True)
+        self.dashboard_log_view.setUndoRedoEnabled(False)
+        self.dashboard_log_view.document().setMaximumBlockCount(300)
+        self.dashboard_log_view.setFont(QFont("Consolas", 8))
+        self.dashboard_log_view.setStyleSheet(
+            "QTextEdit { background-color: #0b0f14; color: #b9f6ca; "
+            "border: 1px solid #2b3747; border-radius: 6px; }"
+        )
+        self.dashboard_log_view.setPlaceholderText("Real-Time Kernel Action Feed")
+        main_layout.addWidget(self.dashboard_log_view)
 
         # Card 2: system status and AI candidates.
         frame2 = QWidget()
@@ -1299,24 +1395,30 @@ class RamOptimizerApp(QMainWindow):
         self.telemetry_dialog = None
 
     def append_telemetry_log(self, message):
-        if self.telemetry_log_view is None:
+        views = [view for view in (
+            self.dashboard_log_view,
+            self.telemetry_log_view,
+        ) if view is not None]
+        if not views:
             return
-        scrollbar = self.telemetry_log_view.verticalScrollBar()
-        follow_bottom = scrollbar.value() >= scrollbar.maximum() - 2
         if "Bellek temizlendi" in message:
             color = "#ff4d6d"
-        elif "Öncelik düşürüldü" in message:
+        elif "PROMOTION" in message:
+            color = "#65a2df"
+        elif "DEMOTION" in message or "Öncelik düşürüldü" in message:
             color = "#ffb347"
         elif "AI" in message or "optimizasyon" in message:
             color = "#f9e2af"
         else:
             color = "#b9f6ca"
-        self.telemetry_log_view.setTextColor(QColor(color))
-        self.telemetry_log_view.append(
-            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}"
-        )
-        if follow_bottom:
-            scrollbar.setValue(scrollbar.maximum())
+        formatted = f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}"
+        for view in views:
+            scrollbar = view.verticalScrollBar()
+            follow_bottom = scrollbar.value() >= scrollbar.maximum() - 2
+            view.setTextColor(QColor(color))
+            view.append(formatted)
+            if follow_bottom:
+                scrollbar.setValue(scrollbar.maximum())
 
     def append_telemetry_tick(self):
         if self.telemetry_status is None:
@@ -1367,6 +1469,17 @@ class RamOptimizerApp(QMainWindow):
         self.lbl_lowered_priority.setText(
             f"{self.t('lowered_priority')}: {data.get('lowered_priority_count', 0)}"
         )
+        self.lbl_promotions.setText(
+            f"Promoted Apps: {data.get('high_promotions_count', 0)}"
+        )
+        self.lbl_resets.setText(
+            f"Priority Resets: {data.get('priority_resets_count', 0)}"
+        )
+        self.lbl_trims.setText(
+            f"RAM Trims: {data.get('ram_trims_count', 0)} triggers | "
+            f"{data.get('accumulated_suppression_mb', 0.0):.1f} MB Freed"
+        )
+        self.update_focus_clock()
 
         # Trigger automatic training every 15 minutes.
         if time.time() - self.last_train_time > self.retrain_interval_sec:
@@ -1380,6 +1493,25 @@ class RamOptimizerApp(QMainWindow):
             self.last_train_time = time.time()
             self.trigger_retrain()
 
+    def update_focus_clock(self):
+        data = getattr(self, "_latest_dashboard_data", {})
+        started_at = data.get("focus_started_at")
+        if started_at is None:
+            return
+        elapsed = max(0.0, time.monotonic() - started_at)
+        name = data.get("active_focus_name", data.get("fg_name", "-"))
+        pid = data.get("active_focus_pid", data.get("active_pid", 0))
+        self.lbl_sustained_focus.setText(
+            f"Hold: {name} (PID {pid}) - {elapsed:.1f}s of 2.0s threshold"
+        )
+        if elapsed >= 2.0:
+            self.lbl_sustained_focus.setStyleSheet(
+                "color: #a6e3a1; font-weight: bold;"
+            )
+        else:
+            self.lbl_sustained_focus.setStyleSheet(
+                "color: #65a2df; font-weight: bold;"
+            )
     def close_app(self):
         self.worker.stop()
         if self.retrain_worker is not None and self.retrain_worker.isRunning():

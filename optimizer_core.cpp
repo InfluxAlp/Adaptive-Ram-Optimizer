@@ -2,37 +2,28 @@
 #include "optimizer_core.h"
 
 #include <chrono>
-#include <condition_variable>
 #include <mutex>
-#include <queue>
 #include <string>
 #include <thread>
 
 namespace {
-constexpr DWORD kMinEvent = EVENT_SYSTEM_FOREGROUND;
-constexpr DWORD kMaxEvent = EVENT_SYSTEM_FOREGROUND;
-constexpr auto kForegroundSettleTime = std::chrono::milliseconds(300);
-
-struct EventItem {
-    HWND window;
-    DWORD process_id;
-    uint64_t timestamp;
-};
+constexpr DWORD kHoldTimeMs = 2000;
+constexpr uint32_t kFocusEvent = 0;
+constexpr uint32_t kPromotionEvent = 1;
+constexpr uint32_t kResetEvent = 2;
+constexpr uint32_t kAbortEvent = 3;
 
 std::mutex g_mutex;
-std::mutex g_queue_mutex;
-std::condition_variable g_queue_cv;
-std::queue<EventItem> g_event_queue;
 HWINEVENTHOOK g_hook = nullptr;
+PTP_TIMER g_timer = nullptr;
+HANDLE g_promoted_process = nullptr;
+DWORD g_target_process_id = 0;
 TelemetryCallback g_callback = nullptr;
 std::thread g_thread;
-std::thread g_worker_thread;
 DWORD g_thread_id = 0;
 HANDLE g_ready_event = nullptr;
 bool g_running = false;
-bool g_worker_stop = false;
-std::wstring g_previous_process;
-std::chrono::steady_clock::time_point g_previous_focus_start;
+bool g_timer_armed = false;
 
 uint64_t unix_time_ms() {
     const auto now = std::chrono::system_clock::now();
@@ -42,10 +33,9 @@ uint64_t unix_time_ms() {
 }
 
 void copy_text(wchar_t* destination, size_t capacity, const std::wstring& value) {
-    if (capacity == 0) {
-        return;
+    if (capacity != 0) {
+        wcsncpy_s(destination, capacity, value.c_str(), _TRUNCATE);
     }
-    wcsncpy_s(destination, capacity, value.c_str(), _TRUNCATE);
 }
 
 std::wstring process_name(DWORD process_id) {
@@ -53,7 +43,6 @@ std::wstring process_name(DWORD process_id) {
     if (!process) {
         return L"";
     }
-
     wchar_t path[MAX_PATH] = {};
     DWORD length = MAX_PATH;
     std::wstring result;
@@ -68,91 +57,130 @@ std::wstring process_name(DWORD process_id) {
     return result;
 }
 
-void emit_foreground_event(const EventItem& item) {
-    wchar_t title[512] = {};
-    GetWindowTextW(item.window, title, static_cast<int>(std::size(title)));
-
-    const auto now = std::chrono::steady_clock::now();
-    uint64_t previous_duration = 0;
+void emit_event(DWORD process_id, HWND window, uint32_t event_id,
+                uint32_t event_status, uint64_t focus_duration_ms) {
     TelemetryCallback callback = nullptr;
-    const std::wstring name = process_name(item.process_id);
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_previous_process.empty()) {
-            previous_duration = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - g_previous_focus_start).count());
-        }
-        g_previous_process = name;
-        g_previous_focus_start = now;
         callback = g_callback;
     }
-
     if (!callback) {
         return;
     }
 
+    wchar_t title[512] = {};
+    if (window) {
+        GetWindowTextW(window, title, static_cast<int>(std::size(title)));
+    }
+    const std::wstring name = process_name(process_id);
     TelemetryData data{};
-    data.process_id = item.process_id;
+    data.process_id = process_id;
     copy_text(data.process_name, std::size(data.process_name), name);
     copy_text(data.window_title, std::size(data.window_title), title);
-    data.timestamp = item.timestamp;
-    data.previous_focus_duration_ms = previous_duration;
+    data.timestamp = unix_time_ms();
+    data.previous_focus_duration_ms = focus_duration_ms;
+    data.active_focus_duration_ms = focus_duration_ms;
+    data.event_id = event_id;
+    data.event_status = event_status;
     callback(data);
 }
 
-void worker_thread() {
-    while (true) {
-        EventItem pending{};
-        {
-            std::unique_lock<std::mutex> lock(g_queue_mutex);
-            g_queue_cv.wait(lock, [] {
-                return g_worker_stop || !g_event_queue.empty();
-            });
-            if (g_worker_stop && g_event_queue.empty()) {
-                return;
-            }
-            pending = g_event_queue.back();
-            std::queue<EventItem>().swap(g_event_queue);
-        }
+void cancel_timer_locked() {
+    if (g_timer) {
+        SetThreadpoolTimer(g_timer, nullptr, 0, 0);
+    }
+}
 
-        auto settle_deadline = std::chrono::steady_clock::now() + kForegroundSettleTime;
-        while (true) {
-            std::unique_lock<std::mutex> lock(g_queue_mutex);
-            if (g_queue_cv.wait_until(lock, settle_deadline, [] {
-                    return g_worker_stop || !g_event_queue.empty();
-                })) {
-                if (g_worker_stop && g_event_queue.empty()) {
-                    return;
-                }
-                if (!g_event_queue.empty()) {
-                    pending = g_event_queue.back();
-                    std::queue<EventItem>().swap(g_event_queue);
-                    settle_deadline = std::chrono::steady_clock::now()
-                        + kForegroundSettleTime;
-                    continue;
-                }
+DWORD revert_promoted_locked() {
+    if (!g_promoted_process) {
+        return 0;
+    }
+    SetPriorityClass(g_promoted_process, NORMAL_PRIORITY_CLASS);
+    const DWORD process_id = g_target_process_id;
+    CloseHandle(g_promoted_process);
+    g_promoted_process = nullptr;
+    return process_id;
+}
+
+void CALLBACK timer_callback(PTP_CALLBACK_INSTANCE, void*, PTP_TIMER) {
+    DWORD process_id = 0;
+    HWND window = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_running) {
+            return;
+        }
+        window = GetForegroundWindow();
+        DWORD foreground_pid = 0;
+        GetWindowThreadProcessId(window, &foreground_pid);
+        g_timer_armed = false;
+        if (foreground_pid != g_target_process_id) {
+            return;
+        }
+        process_id = g_target_process_id;
+        HANDLE process = OpenProcess(PROCESS_SET_INFORMATION, FALSE, process_id);
+        if (!process || !SetPriorityClass(process, HIGH_PRIORITY_CLASS)) {
+            if (process) {
+                CloseHandle(process);
             }
-            lock.unlock();
-            emit_foreground_event(pending);
-            break;
+            return;
+        }
+        g_promoted_process = process;
+    }
+    emit_event(process_id, window, kPromotionEvent, kPromotionEvent, kHoldTimeMs);
+}
+
+void on_window_focus_changed(HWND window) {
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(window, &process_id);
+    const std::wstring name = process_name(process_id);
+    const bool excluded = !process_id || name.empty() ||
+        name == L"explorer.exe" || name == L"cmd.exe" ||
+        name == L"conhost.exe" || name == L"system.exe" ||
+        name == L"smss.exe" || name == L"csrss.exe" ||
+        name == L"wininit.exe" || name == L"services.exe";
+
+    DWORD reverted_process_id = 0;
+    DWORD aborted_process_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_timer_armed && !g_promoted_process) {
+            aborted_process_id = g_target_process_id;
+        }
+        cancel_timer_locked();
+        g_timer_armed = false;
+        reverted_process_id = revert_promoted_locked();
+        if (excluded) {
+            g_target_process_id = 0;
+        } else {
+            g_target_process_id = process_id;
+        }
+        if (!excluded && g_timer) {
+            FILETIME due_time{};
+            const LONGLONG relative_100ns =
+                -static_cast<LONGLONG>(kHoldTimeMs) * 10000;
+            ULARGE_INTEGER relative_time{};
+            relative_time.QuadPart = static_cast<ULONGLONG>(relative_100ns);
+            due_time.dwLowDateTime = static_cast<DWORD>(relative_time.LowPart);
+            due_time.dwHighDateTime = static_cast<DWORD>(relative_time.HighPart);
+            SetThreadpoolTimer(g_timer, &due_time, 0, 0);
+            g_timer_armed = true;
         }
     }
+    if (reverted_process_id) {
+        emit_event(reverted_process_id, nullptr, kResetEvent, kResetEvent, 0);
+    }
+    if (aborted_process_id) {
+        emit_event(aborted_process_id, nullptr, kAbortEvent, kAbortEvent, 0);
+    }
+    emit_event(process_id, window, kFocusEvent, kFocusEvent, 0);
 }
 
 void CALLBACK win_event_proc(
     HWINEVENTHOOK, DWORD event, HWND window, LONG, LONG, DWORD, DWORD) {
-    if (event != EVENT_SYSTEM_FOREGROUND || !window) {
-        return;
+    if (event == EVENT_SYSTEM_FOREGROUND && window) {
+        on_window_focus_changed(window);
     }
-
-    DWORD process_id = 0;
-    GetWindowThreadProcessId(window, &process_id);
-    {
-        std::lock_guard<std::mutex> lock(g_queue_mutex);
-        g_event_queue.push({window, process_id, unix_time_ms()});
-    }
-    g_queue_cv.notify_one();
 }
 
 void event_thread() {
@@ -160,28 +188,24 @@ void event_thread() {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_thread_id = GetCurrentThreadId();
         g_hook = SetWinEventHook(
-            kMinEvent, kMaxEvent, nullptr, win_event_proc, 0, 0,
-            WINEVENT_OUTOFCONTEXT);
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr,
+            win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT);
         if (!g_hook) {
             g_running = false;
         }
     }
     SetEvent(g_ready_event);
-    {
+    if (!g_hook) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_hook) {
-            g_thread_id = 0;
-            return;
-        }
+        g_thread_id = 0;
+        return;
     }
 
     MSG message{};
-    BOOL result;
-    while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_hook) {
         UnhookWinEvent(g_hook);
@@ -196,7 +220,6 @@ BOOL WINAPI optimizer_start(TelemetryCallback callback) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-
     HANDLE ready_event = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -204,32 +227,27 @@ BOOL WINAPI optimizer_start(TelemetryCallback callback) {
             SetLastError(ERROR_ALREADY_INITIALIZED);
             return FALSE;
         }
-
         g_callback = callback;
-        g_previous_process.clear();
-        g_previous_focus_start = std::chrono::steady_clock::now();
         g_ready_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!g_ready_event) {
             g_callback = nullptr;
             return FALSE;
         }
-        ready_event = g_ready_event;
-        {
-            std::lock_guard<std::mutex> queue_lock(g_queue_mutex);
-            std::queue<EventItem>().swap(g_event_queue);
-            g_worker_stop = false;
+        g_timer = CreateThreadpoolTimer(timer_callback, nullptr, nullptr);
+        if (!g_timer) {
+            CloseHandle(g_ready_event);
+            g_ready_event = nullptr;
+            g_callback = nullptr;
+            return FALSE;
         }
+        ready_event = g_ready_event;
         g_running = true;
         try {
-            g_worker_thread = std::thread(worker_thread);
             g_thread = std::thread(event_thread);
         } catch (...) {
             g_running = false;
-            g_worker_stop = true;
-            g_queue_cv.notify_all();
-            if (g_worker_thread.joinable()) {
-                g_worker_thread.join();
-            }
+            CloseThreadpoolTimer(g_timer);
+            g_timer = nullptr;
             CloseHandle(g_ready_event);
             g_ready_event = nullptr;
             g_callback = nullptr;
@@ -238,7 +256,6 @@ BOOL WINAPI optimizer_start(TelemetryCallback callback) {
         }
     }
     WaitForSingleObject(ready_event, INFINITE);
-
     bool started = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -255,31 +272,37 @@ BOOL WINAPI optimizer_start(TelemetryCallback callback) {
 
 BOOL WINAPI optimizer_stop() {
     std::thread event_thread_to_join;
-    std::thread worker_thread_to_join;
+    PTP_TIMER timer_to_close = nullptr;
+    HANDLE promoted_process = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_running && !g_thread.joinable() && !g_worker_thread.joinable()) {
+        if (!g_running && !g_thread.joinable()) {
             return TRUE;
         }
         g_running = false;
-        if (g_thread_id != 0) {
+        cancel_timer_locked();
+        if (g_thread_id) {
             PostThreadMessageW(g_thread_id, WM_QUIT, 0, 0);
         }
         event_thread_to_join = std::move(g_thread);
-        worker_thread_to_join = std::move(g_worker_thread);
+        timer_to_close = g_timer;
+        g_timer = nullptr;
+        promoted_process = g_promoted_process;
+        g_promoted_process = nullptr;
     }
-    {
-        std::lock_guard<std::mutex> lock(g_queue_mutex);
-        g_worker_stop = true;
-    }
-    g_queue_cv.notify_all();
     if (event_thread_to_join.joinable()) {
         event_thread_to_join.join();
     }
-    if (worker_thread_to_join.joinable()) {
-        worker_thread_to_join.join();
+    if (timer_to_close) {
+        WaitForThreadpoolTimerCallbacks(timer_to_close, TRUE);
+        CloseThreadpoolTimer(timer_to_close);
+    }
+    if (promoted_process) {
+        SetPriorityClass(promoted_process, NORMAL_PRIORITY_CLASS);
+        CloseHandle(promoted_process);
     }
     std::lock_guard<std::mutex> lock(g_mutex);
+    g_target_process_id = 0;
     g_callback = nullptr;
     return TRUE;
 }
