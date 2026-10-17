@@ -15,6 +15,9 @@ struct TelemetryData {
     wchar_t window_title[512];
     uint64_t timestamp;
     uint64_t previous_focus_duration_ms;
+    uint64_t active_focus_duration_ms;
+    uint32_t event_id;
+    uint32_t event_status;
 };
 
 typedef void (*TelemetryCallback)(TelemetryData data);

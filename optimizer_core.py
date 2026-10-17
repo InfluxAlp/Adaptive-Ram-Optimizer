@@ -14,6 +14,9 @@ class TelemetryData(ctypes.Structure):
         ("window_title", ctypes.c_wchar * 512),
         ("timestamp", ctypes.c_uint64),
         ("previous_focus_duration_ms", ctypes.c_uint64),
+        ("active_focus_duration_ms", ctypes.c_uint64),
+        ("event_id", ctypes.c_uint32),
+        ("event_status", ctypes.c_uint32),
     ]
 
 
