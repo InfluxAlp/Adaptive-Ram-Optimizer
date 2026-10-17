@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Personal AI models and telemetry generated during local training.
+*.pkl
+*.joblib
+*.model
+ml_dataset_telemetry.db
+ml_dataset_telemetry.db-wal
+ml_dataset_telemetry.db-shm
+ram_optimizer_model.pkl
+
+# Local test/training output.
+test_*.db
+test_*.json
+test_*.log
