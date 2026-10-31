@@ -8,21 +8,21 @@ import json
 import uuid
 import ctypes
 import queue
+import subprocess
 from ctypes import wintypes
 import psutil
 import winreg  # Windows startup registry integration
 import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QFrame, QSystemTrayIcon, QMenu,
                              QMessageBox, QDialog, QFormLayout, QDoubleSpinBox,
                              QSpinBox, QDialogButtonBox, QLineEdit, QTextEdit)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QFont, QFontDatabase, QColor
-
-from model_runtime import RuntimeTelemetry, predict_candidates
-from training_worker import AutoTrainWorker
-from optimizer_core import OptimizerCore
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -37,6 +37,189 @@ MemoryPriority = 2
 ProcessMemoryPriority = 9
 class MEMORY_PRIORITY_INFORMATION(ctypes.Structure):
     _fields_ = [("MemoryPriority", wintypes.ULONG)]
+
+
+FEATURE_COLUMNS = [
+    "hour", "is_weekend", "working_set_mb", "commit_size_mb",
+    "cpu_percent", "thread_count", "handle_count",
+    "accumulated_fg_sec", "accumulated_bg_sec", "focus_ratio",
+    "ram_percent",
+]
+
+
+class RuntimeTelemetry:
+    def __init__(self):
+        self.high_promotions_count = 0
+        self.priority_resets_count = 0
+        self.ram_trims_count = 0
+        self.accumulated_suppression_mb = 0.0
+
+
+def predict_candidates(model, rows):
+    if model is None or not rows:
+        return {}
+
+    frame = pd.DataFrame(rows, columns=["pid", *FEATURE_COLUMNS])
+    features = frame[FEATURE_COLUMNS]
+    predictions = model.predict(features)
+    confidences = [0.0] * len(frame)
+
+    if hasattr(model, "predict_proba") and 1 in model.classes_:
+        positive_index = list(model.classes_).index(1)
+        positive_rows = [
+            index for index, value in enumerate(predictions) if int(value) == 1
+        ]
+        if positive_rows:
+            probabilities = model.predict_proba(features.iloc[positive_rows])
+            for row_index, probability in zip(positive_rows, probabilities):
+                confidences[row_index] = float(probability[positive_index])
+
+    return {
+        int(pid): {
+            "prediction": int(prediction),
+            "confidence": confidence,
+        }
+        for pid, prediction, confidence in zip(
+            frame["pid"], predictions, confidences
+        )
+    }
+
+
+class AutoTrainWorker(QThread):
+    training_finished = pyqtSignal(str)
+
+    def __init__(
+        self,
+        db_path="ml_dataset_telemetry.db",
+        model_path="ram_optimizer_model.pkl",
+        cleanup_callback=None,
+    ):
+        super().__init__()
+        self.db_path = db_path
+        self.model_path = model_path
+        self.cleanup_callback = cleanup_callback
+        self._stop_requested = False
+
+    def request_stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            df_snapshots = pd.read_sql_query(
+                "SELECT * FROM system_snapshots ORDER BY snapshot_id DESC LIMIT 1000",
+                conn,
+            )
+            df_telemetry = pd.read_sql_query(
+                "SELECT * FROM process_telemetry ORDER BY id DESC LIMIT 15000",
+                conn,
+            )
+            conn.close()
+
+            if self._stop_requested:
+                self.training_finished.emit("Training stopped")
+                return
+            if len(df_telemetry) < 100:
+                self.training_finished.emit("Not enough data to train the model")
+                return
+
+            df = df_telemetry.copy()
+            total_time = df["accumulated_fg_sec"] + df["accumulated_bg_sec"]
+            df["focus_ratio"] = np.where(
+                total_time > 0,
+                df["accumulated_fg_sec"] / total_time,
+                0.0,
+            )
+            df = df.merge(
+                df_snapshots[["snapshot_id", "hour", "is_weekend", "ram_percent"]],
+                on="snapshot_id",
+                how="left",
+            )
+            df["target_optimize_candidate"] = np.where(
+                (df["is_foreground"] == 0)
+                & (df["focus_ratio"] < 0.10)
+                & (df["working_set_mb"] > 30.0),
+                1,
+                0,
+            )
+
+            X = df[FEATURE_COLUMNS].fillna(0)
+            y = df["target_optimize_candidate"]
+            if self._stop_requested:
+                self.training_finished.emit("Training stopped")
+                return
+
+            model = RandomForestClassifier(
+                n_estimators=60,
+                max_depth=10,
+                random_state=42,
+                n_jobs=1,
+            )
+            model.fit(X, y)
+            if self._stop_requested:
+                self.training_finished.emit("Training stopped")
+                return
+
+            joblib.dump(model, self.model_path)
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            self.training_finished.emit(f"Model updated ({now_str})")
+        except Exception as error:
+            self.training_finished.emit(f"Training error: {error}")
+        finally:
+            gc.collect()
+            if self.cleanup_callback is not None:
+                self.cleanup_callback(os.getpid())
+
+
+class TelemetryData(ctypes.Structure):
+    _fields_ = [
+        ("process_id", wintypes.DWORD),
+        ("process_name", ctypes.c_wchar * 256),
+        ("window_title", ctypes.c_wchar * 512),
+        ("timestamp", ctypes.c_uint64),
+        ("previous_focus_duration_ms", ctypes.c_uint64),
+        ("active_focus_duration_ms", ctypes.c_uint64),
+        ("event_id", ctypes.c_uint32),
+        ("event_status", ctypes.c_uint32),
+    ]
+
+
+TelemetryCallback = ctypes.WINFUNCTYPE(None, TelemetryData)
+
+
+class OptimizerCore:
+    def __init__(self, dll_path=None):
+        path = dll_path or os.path.join(
+            os.path.dirname(__file__), "optimizer_core.dll"
+        )
+        self._dll = ctypes.WinDLL(path, use_last_error=True)
+        self._dll.optimizer_start.argtypes = [TelemetryCallback]
+        self._dll.optimizer_start.restype = wintypes.BOOL
+        self._dll.optimizer_stop.argtypes = []
+        self._dll.optimizer_stop.restype = wintypes.BOOL
+        self._dll.optimizer_is_running.argtypes = []
+        self._dll.optimizer_is_running.restype = wintypes.BOOL
+        self._callback = None
+
+    def start(self, callback):
+        if self._callback is not None:
+            raise RuntimeError("Optimizer core is already started")
+        self._callback = TelemetryCallback(callback)
+        if not self._dll.optimizer_start(self._callback):
+            self._callback = None
+            error = ctypes.get_last_error()
+            raise OSError(error, "optimizer_start failed")
+
+    def stop(self):
+        if self._callback is None:
+            return
+        if not self._dll.optimizer_stop():
+            error = ctypes.get_last_error()
+            raise OSError(error, "optimizer_stop failed")
+        self._callback = None
+
+    def is_running(self):
+        return bool(self._dll.optimizer_is_running())
 
 OPTIMIZATION_MODES = {
     "soft": {
@@ -150,12 +333,21 @@ PROTECTED_PROCESS_NAMES = {
     "adaptive_ram_optimizer.exe"
 }
 MODEL_CONFIDENCE_THRESHOLD = 0.80
+PRIORITY_CONFIDENCE_THRESHOLD = 0.72
+PRIORITY_SAFETY_THRESHOLD = 0.80
+UNKNOWN_PROCESS_PRIORITY_CONFIDENCE = 0.85
 HIGH_PRIORITY_SCORE_THRESHOLD = 65.0
 HIGH_PRIORITY_MIN_FOREGROUND_SECONDS = 60.0
 MIN_BACKGROUND_SECONDS = 30.0
+MIN_PRIORITY_BACKGROUND_SECONDS = 45.0
 MIN_WORKING_SET_MB = 30.0
 MIN_SYSTEM_RAM_PERCENT = 85.0
 TRIM_COOLDOWN_SECONDS = 180.0
+PRIORITY_COOLDOWN_SECONDS = 120.0
+MAX_PRIORITY_CHANGES_PER_PASS = 8
+HIGH_CPU_PROTECTION_PERCENT = 85.0
+HIGH_GPU_PROTECTION_PERCENT = 60.0
+GPU_SAMPLE_CACHE_SECONDS = 5.0
 FOREGROUND_PROCESS_MIN_INTERVAL_SEC = 2.0
 
 
@@ -338,6 +530,13 @@ class EventDrivenTelemetryWorker(QThread):
         self._last_processed_process = None
         self._accumulators = {}
         self._last_trim_times = {}
+        self._priority_processes = {}
+        self._priority_process_names = {}
+        self._priority_verified = set()
+        self._priority_last_attempts = {}
+        self._gpu_backend = None
+        self._last_gpu_sample_at = 0.0
+        self._last_gpu_utilization = None
         self._last_optimization_at = 0.0
         self._lowered_priority_pids = set()
         self._event_count = 0
@@ -345,6 +544,7 @@ class EventDrivenTelemetryWorker(QThread):
         self._focus_started_at = None
         self._active_focus_name = "-"
         self._active_focus_pid = 0
+        self._active_focus_title = ""
         self._last_dashboard_data = {}
         self.load_ml_model()
 
@@ -380,6 +580,19 @@ class EventDrivenTelemetryWorker(QThread):
     def _run_manual_optimization(self):
         optimized_count = 0
         released_memory_mb = 0.0
+        gpu_utilization = self._get_gpu_utilization()
+        if (
+            gpu_utilization is not None
+            and gpu_utilization >= HIGH_GPU_PROTECTION_PERCENT
+        ):
+            self._restore_managed_priorities()
+            self._log(
+                f"Manuel optimizasyon GPU yükü nedeniyle atlandı: "
+                f"%{gpu_utilization:.0f}."
+            )
+            self.data_updated.emit(self._runtime_data())
+            self.manual_optimization_finished.emit(0, 0.0)
+            return
 
         foreground_pid = 0
         try:
@@ -479,6 +692,18 @@ class EventDrivenTelemetryWorker(QThread):
                 accumulated_bg_sec REAL DEFAULT 0
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS process_safety (
+                process_name TEXT PRIMARY KEY,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                safe_successes INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                user_overrides INTEGER NOT NULL DEFAULT 0,
+                last_outcome TEXT,
+                cooldown_until TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
         connection.commit()
 
     @staticmethod
@@ -491,6 +716,179 @@ class EventDrivenTelemetryWorker(QThread):
         ).fetchone()
         return row[0] if row else "Not enough data yet"
 
+    def _emit_live_dashboard_data(self):
+        """Refresh live system values even when no foreground event occurs."""
+        system_memory = psutil.virtual_memory()
+        data = self._runtime_data()
+        data.update({
+            "fg_name": self._active_focus_name,
+            "fg_title": self._active_focus_title,
+            "active_pid": self._active_focus_pid,
+            "ram_percent": system_memory.percent,
+            "used_ram_mb": round(
+                (system_memory.total - system_memory.available) / (1024 * 1024), 2
+            ),
+        })
+        self._last_dashboard_data = data
+        self.data_updated.emit(data)
+
+    def _restore_foreground_priority(self, pid):
+        if pid not in self._priority_processes:
+            return False
+        if set_process_priorities(pid, is_foreground=True):
+            self._priority_processes.pop(pid, None)
+            self._priority_process_names.pop(pid, None)
+            self._priority_verified.discard(pid)
+            self._priority_last_attempts.pop(pid, None)
+            self._log(f"Öncelik normale döndürüldü: PID {pid}")
+            return True
+        return False
+
+    def _restore_managed_priorities(self):
+        for pid in list(self._priority_processes):
+            self._restore_foreground_priority(pid)
+
+    @staticmethod
+    def _record_safety_outcome(connection, process_name, outcome):
+        if not process_name:
+            return
+        now_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        connection.execute(
+            """
+            INSERT INTO process_safety (
+                process_name, attempts, safe_successes, failures,
+                user_overrides, last_outcome, cooldown_until, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(process_name) DO UPDATE SET
+                attempts = attempts + 1,
+                safe_successes = safe_successes + excluded.safe_successes,
+                failures = failures + excluded.failures,
+                user_overrides = user_overrides + excluded.user_overrides,
+                last_outcome = excluded.last_outcome,
+                cooldown_until = excluded.cooldown_until,
+                updated_at = excluded.updated_at
+            """,
+            (
+                process_name,
+                int(outcome == "safe_success"),
+                int(outcome == "failure"),
+                int(outcome == "user_override"),
+                outcome,
+                now_text if outcome == "failure" else None,
+                now_text,
+            ),
+        )
+
+    @staticmethod
+    def _priority_safety_allows(connection, process_name, confidence):
+        row = connection.execute(
+            """
+            SELECT attempts, safe_successes, failures, user_overrides
+            FROM process_safety WHERE process_name=?
+            """,
+            (process_name,),
+        ).fetchone()
+        if row is None:
+            return confidence >= UNKNOWN_PROCESS_PRIORITY_CONFIDENCE
+        attempts, successes, failures, overrides = row
+        if failures >= 3 or (attempts >= 5 and failures / attempts > 0.35):
+            return False
+        if attempts < 3:
+            return confidence >= UNKNOWN_PROCESS_PRIORITY_CONFIDENCE
+        safety_score = (successes + 1.0) / (attempts + 2.0)
+        return safety_score >= PRIORITY_SAFETY_THRESHOLD and overrides < attempts
+
+    def _detect_gpu_backend(self):
+        """Detect the GPU vendor once so unsupported tools are never polled."""
+        if self._gpu_backend is not None:
+            return self._gpu_backend
+
+        self._gpu_backend = "unknown"
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                self._gpu_backend = "nvidia"
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        if self._gpu_backend == "unknown" and os.name == "nt":
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "(Get-CimInstance Win32_VideoController | "
+                        "Select-Object -ExpandProperty Name) -join ';'",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                gpu_names = result.stdout.lower()
+                if "amd" in gpu_names or "radeon" in gpu_names:
+                    self._gpu_backend = "amd"
+                elif "intel" in gpu_names:
+                    self._gpu_backend = "intel"
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        self._log(
+            f"GPU backend: {self._gpu_backend}; "
+            + (
+                "GPU load protection enabled."
+                if self._gpu_backend == "nvidia"
+                else "CPU and protected-process safeguards enabled."
+            )
+        )
+        return self._gpu_backend
+
+    def _get_gpu_utilization(self):
+        """Return cached NVIDIA utilization; AMD/Intel are intentionally not polled."""
+        if self._detect_gpu_backend() != "nvidia":
+            return None
+
+        now = time.monotonic()
+        if now - self._last_gpu_sample_at < GPU_SAMPLE_CACHE_SECONDS:
+            return self._last_gpu_utilization
+
+        self._last_gpu_sample_at = now
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                self._last_gpu_utilization = None
+                return None
+            samples = [
+                float(line.strip())
+                for line in result.stdout.splitlines()
+                if line.strip()
+            ]
+            self._last_gpu_utilization = max(samples) if samples else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self._last_gpu_utilization = None
+        return self._last_gpu_utilization
+
     def run(self):
         connection = sqlite3.connect(self.db_path)
         self._init_db(connection)
@@ -499,8 +897,13 @@ class EventDrivenTelemetryWorker(QThread):
         try:
             self._core = OptimizerCore()
             self._core.start(self._events.put)
+            self._detect_gpu_backend()
             while not self._stop_requested:
-                event = self._events.get()
+                try:
+                    event = self._events.get(timeout=1.0)
+                except queue.Empty:
+                    self._emit_live_dashboard_data()
+                    continue
                 if event is None:
                     break
                 if isinstance(event, tuple) and event[0] == "manual_optimization":
@@ -536,6 +939,16 @@ class EventDrivenTelemetryWorker(QThread):
                 title = event.window_title
                 self._active_focus_name = process_name
                 self._active_focus_pid = event.process_id
+                self._active_focus_title = title
+                priority_was_managed = event.process_id in self._priority_processes
+                managed_process_name = self._priority_process_names.get(
+                    event.process_id, process_name
+                )
+                self._restore_foreground_priority(event.process_id)
+                if priority_was_managed:
+                    self._record_safety_outcome(
+                        connection, managed_process_name, "user_override"
+                    )
                 self._focus_started_at = time.monotonic()
                 self._log(
                     f"[EVENT] Focus changed to: {process_name} "
@@ -614,10 +1027,11 @@ class EventDrivenTelemetryWorker(QThread):
                 optimized_count = 0
                 released_memory_mb = 0.0
                 model_rows = []
+                process_metrics = {}
                 process_count = 0
                 for process in psutil.process_iter([
                     "pid", "name", "memory_info", "num_threads",
-                    "num_handles", "cpu_percent",
+                    "num_handles", "cpu_percent", "create_time",
                 ]):
                     try:
                         info = process.info
@@ -646,6 +1060,13 @@ class EventDrivenTelemetryWorker(QThread):
                             handles, fg_sec, bg_sec, focus_ratio, system_memory.percent,
                         )
                         model_rows.append(row)
+                        process_metrics[pid] = {
+                            "process_name": name.lower(),
+                            "working_set_mb": working_set_mb,
+                            "cpu_percent": cpu_percent,
+                            "focus_ratio": focus_ratio,
+                            "create_time": info.get("create_time"),
+                        }
                         connection.execute(
                             "INSERT INTO process_telemetry "
                             "(snapshot_id,pid,process_name,is_foreground,working_set_mb,"
@@ -658,6 +1079,24 @@ class EventDrivenTelemetryWorker(QThread):
                         )
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
                         continue
+
+                for managed_pid in list(self._priority_processes):
+                    if managed_pid in process_metrics or psutil.pid_exists(managed_pid):
+                        continue
+                    managed_name = self._priority_process_names.get(
+                        managed_pid, "unknown"
+                    )
+                    self._record_safety_outcome(
+                        connection, managed_name, "failure"
+                    )
+                    self._priority_processes.pop(managed_pid, None)
+                    self._priority_process_names.pop(managed_pid, None)
+                    self._priority_verified.discard(managed_pid)
+                    self._priority_last_attempts.pop(managed_pid, None)
+                    self._log(
+                        f"AI güvenlik uyarısı: {managed_name} işlemi sonlandı; "
+                        "priority kararı geçici olarak engellendi."
+                    )
 
                 self._log(f"{process_count} süreç tarandı; AI adayları hesaplanıyor.")
                 predictions = predict_candidates(self.model, model_rows)
@@ -675,47 +1114,123 @@ class EventDrivenTelemetryWorker(QThread):
                     now_monotonic - self._last_optimization_at >= mode["interval_sec"]
                 )
                 if optimization_due:
-                    self._log("Optimizasyon koşulları kontrol ediliyor.")
+                    gpu_utilization = self._get_gpu_utilization()
+                    gpu_busy = (
+                        gpu_utilization is not None
+                        and gpu_utilization >= HIGH_GPU_PROTECTION_PERCENT
+                    )
+                    if gpu_busy:
+                        self._log(
+                            f"GPU yükü %{gpu_utilization:.0f}; "
+                            "priority ve RAM trim korunuyor."
+                        )
+                        self._restore_managed_priorities()
+                    self._log(
+                        "AI optimizasyon pass'i: priority ve RAM kararları ayrıştırılıyor."
+                    )
+                    priority_changes = 0
                     for pid, state in list(self._accumulators.items()):
-                        if pid == event.process_id or _process_name(pid) in PROTECTED_PROCESS_NAMES:
-                            continue
                         if (
-                            state["bg_sec"] < mode["background_sec"]
-                            or system_memory.percent < mode["ram_percent"]
+                            pid == event.process_id
+                            or _process_name(pid) in PROTECTED_PROCESS_NAMES
+                            or priority_changes >= MAX_PRIORITY_CHANGES_PER_PASS
                         ):
+                            continue
+                        metrics = process_metrics.get(pid)
+                        if metrics is None:
+                            continue
+                        create_time = metrics["create_time"]
+                        if (
+                            pid in self._priority_processes
+                            and pid not in self._priority_verified
+                            and self._priority_processes[pid] == create_time
+                            and metrics["cpu_percent"] < HIGH_CPU_PROTECTION_PERCENT
+                        ):
+                            self._record_safety_outcome(
+                                connection, metrics["process_name"], "safe_success"
+                            )
+                            self._priority_verified.add(pid)
+                            self._log(
+                                f"AI güvenlik doğrulandı: {metrics['process_name']} "
+                                "BelowNormal altında kararlı kaldı."
+                            )
+                        if gpu_busy:
+                            continue
+                        if state["bg_sec"] < max(
+                            mode["background_sec"], MIN_PRIORITY_BACKGROUND_SECONDS
+                        ):
+                            continue
+                        if metrics["cpu_percent"] >= HIGH_CPU_PROTECTION_PERCENT:
+                            self._restore_foreground_priority(pid)
+                            self._log(
+                                f"Priority normale alındı: PID {pid}, "
+                                f"CPU %{metrics['cpu_percent']:.1f}."
+                            )
                             continue
                         prediction = predictions.get(pid, {})
+                        confidence = prediction.get("confidence", 0.0)
                         if self.model is not None and (
                             prediction.get("prediction") != 1
-                            or prediction.get("confidence", 0.0) < MODEL_CONFIDENCE_THRESHOLD
+                            or confidence < PRIORITY_CONFIDENCE_THRESHOLD
                         ):
                             continue
-                        if self.model is None and state["bg_sec"] < max(
-                            mode["background_sec"], MIN_BACKGROUND_SECONDS
+                        if create_time is None:
+                            continue
+                        if not self._priority_safety_allows(
+                            connection, metrics["process_name"], confidence
                         ):
                             continue
+                        known_create_time = self._priority_processes.get(pid)
+                        if known_create_time is not None and known_create_time != create_time:
+                            self._priority_processes.pop(pid, None)
+                            self._priority_process_names.pop(pid, None)
+                            self._priority_verified.discard(pid)
+                            self._priority_last_attempts.pop(pid, None)
                         if (
-                            now_monotonic - self._last_trim_times.get(pid, 0.0)
-                            < trim_cooldown_sec
+                            now_monotonic
+                            - self._priority_last_attempts.get(pid, 0.0)
+                            < PRIORITY_COOLDOWN_SECONDS
                         ):
                             continue
-                        reduction = trim_process_memory(pid)
-                        if reduction is not None:
-                            optimized_count += 1
-                            released_memory_mb += reduction
-                            self._runtime.ram_trims_count += 1
-                            self._runtime.accumulated_suppression_mb += reduction
-                            self._last_trim_times[pid] = now_monotonic
-                            self._log(
-                                f"Bellek temizlendi: PID {pid}, "
-                                f"{reduction:.2f} MB azaltıldı."
-                            )
-                        if (
-                            pid not in self._lowered_priority_pids
-                            and set_process_priorities(pid, is_candidate=True)
-                        ):
+                        priority_changed = set_process_priorities(pid, is_candidate=True)
+                        self._priority_last_attempts[pid] = now_monotonic
+                        if priority_changed:
+                            self._priority_processes[pid] = create_time
+                            self._priority_process_names[pid] = metrics["process_name"]
+                            self._priority_verified.discard(pid)
+                            priority_changes += 1
                             self._lowered_priority_pids.add(pid)
-                            self._log(f"Öncelik düşürüldü: PID {pid}")
+                            self._log(
+                                f"AI priority: PID {pid} BelowNormal yapıldı "
+                                f"(güven %{confidence * 100:.0f}, RAM bağımsız)."
+                            )
+
+                        ram_pressure = system_memory.percent >= mode["ram_percent"]
+                        trim_allowed = (
+                            ram_pressure
+                            and metrics["working_set_mb"] >= MIN_WORKING_SET_MB
+                            and (
+                                self.model is None
+                                or (
+                                    prediction.get("prediction") == 1
+                                    and confidence >= MODEL_CONFIDENCE_THRESHOLD
+                                )
+                            )
+                            and now_monotonic - self._last_trim_times.get(pid, 0.0)
+                            >= trim_cooldown_sec
+                        )
+                        if trim_allowed:
+                            reduction = trim_process_memory(pid)
+                            if reduction is not None:
+                                optimized_count += 1
+                                released_memory_mb += reduction
+                                self._runtime.ram_trims_count += 1
+                                self._runtime.accumulated_suppression_mb += reduction
+                                self._last_trim_times[pid] = now_monotonic
+                                self._log(
+                                    f"AI RAM trim: PID {pid}, "
+                                    f"{reduction:.2f} MB azaltıldı."
+                                )
                     self._last_optimization_at = now_monotonic
                 connection.commit()
                 dashboard_data = {
@@ -791,7 +1306,7 @@ class RamOptimizerApp(QMainWindow):
         self.init_ui()
         if not is_autostart_enabled():
             set_autostart(True)
-        
+
         # Start the telemetry worker.
         self.worker = EventDrivenTelemetryWorker(db_path=self.db_path, model_path=self.model_path)
         self.worker.set_optimization_mode(self.optimization_mode)
@@ -1138,7 +1653,7 @@ class RamOptimizerApp(QMainWindow):
         font_families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
         font_family = font_families[0] if font_families else "Segoe UI"
         QApplication.instance().setFont(QFont(font_family, 9))
-        
+
         self.setStyleSheet("""
             QMainWindow { background-color: #10141c; }
             QLabel {

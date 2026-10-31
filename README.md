@@ -38,7 +38,7 @@ candidates.
 
 ## ✨ Key Features
 
-- Event-driven telemetry core using `SetWinEventHook` instead of polling
+- Event-driven telemetry core using `SetWinEventHook` with a lightweight live UI heartbeat
 - `ctypes` callback bridge between a C++17 native DLL and Python
 - Producer-consumer queue with 300 ms foreground-event debounce
 - Relational telemetry database using SQLite WAL mode
@@ -95,8 +95,9 @@ after a foreground event.
 
 ### 🐍 Python and Data Pipeline
 
-[`optimizer_core.py`](optimizer_core.py) maps the native `TelemetryData` struct
-to `ctypes.Structure` and keeps the `WINFUNCTYPE` callback alive.
+[`app_gui.py`](app_gui.py) contains the Qt interface, telemetry runtime,
+training worker, model runtime, and `ctypes` bridge in one Python entry point.
+The native callback remains alive for the lifetime of the event-driven worker.
 
 The telemetry pipeline:
 
@@ -105,6 +106,38 @@ The telemetry pipeline:
 - Uses SQLite WAL and indexes to reduce read/write contention.
 - Derives model features from time, memory, and `focus_ratio` metrics.
 - Predicts processes that may be suitable for background optimization.
+
+### 🤖 Adaptive decision policy
+
+The model now separates two actions:
+
+- **Priority management** can run independently of RAM pressure. A process must
+  have remained in the background for at least 45 seconds, pass the model
+  confidence threshold, stay below 85% CPU, and not be a protected/system
+  process. At most eight priority changes are attempted per optimization pass.
+- **Working-set trimming** remains tied to the selected RAM threshold and uses
+  the stricter model confidence threshold plus a per-process cooldown.
+
+Foreground applications are restored to normal priority immediately. Process
+creation times are tracked so a reused PID cannot inherit an old decision.
+These limits keep the optimizer event-driven and prevent background priority
+changes from turning into a high-frequency resource consumer.
+
+At startup of the first optimization pass, the GPU vendor is detected once.
+Only NVIDIA systems with a working `nvidia-smi` use GPU load sampling, and it
+is then sampled at most once every five seconds. At 60% or higher GPU load,
+managed priorities are restored to normal and both priority changes and
+working-set trims are paused for that optimization pass. AMD Radeon and Intel
+systems never launch `nvidia-smi`; they continue using the CPU,
+protected-process, and foreground safeguards. This avoids repeated missing
+command checks while keeping GPU-heavy workloads conservative.
+
+Priority safety history is stored as one compact aggregate row per process:
+attempts, stable successes, failures, user overrides, and the last outcome.
+The model must be highly confident for unknown processes; after enough
+observations, a process is allowed to use `BELOW_NORMAL` only when its
+historical safety score is high. No per-second outcome log is created, so
+this safety layer adds negligible disk usage compared with normal telemetry.
 
 ## 🧰 Technology and Engineering Stack
 
@@ -151,8 +184,7 @@ The telemetry pipeline:
 - PyInstaller
 - One-file, windowed Windows executable
 - GitHub Actions
-- Matplotlib
-- Automated FPS and frame-pacing charts
+- Benchmark images stored in `docs/`
 - Windows batch build scripts
 
 ## 📁 Project Structure
@@ -162,12 +194,6 @@ AdaptiveRamOptimizer/
 ├── app_gui.py                       # Main PyQt6 interface
 ├── optimizer_core.cpp               # Win32 event hook and C++ worker
 ├── optimizer_core.h                 # DLL API and TelemetryData struct
-├── optimizer_core.py                # ctypes DLL bridge
-├── advanced_telemetry_collector.py  # SQLite telemetry collector
-├── model_runtime.py                 # Model feature/prediction runtime
-├── train_ram_optimizer_model.py     # Manual model-training script
-├── training_worker.py               # GUI background-training worker
-├── generate_charts.py               # Benchmark chart generator
 ├── CMakeLists.txt                   # Native DLL build definition
 ├── requirements.txt                 # Python dependencies
 ├── AdaptiveRamOptimizer.spec        # PyInstaller specification
@@ -249,34 +275,7 @@ py -3 -m PyInstaller --noconfirm --clean --onefile --windowed `
 py -3 app_gui.py
 ```
 
-### 📡 Run the Telemetry Collector
-
-```powershell
-py -3 advanced_telemetry_collector.py
-```
-
-### 🧪 Train the Model
-
-After collecting enough telemetry:
-
-```powershell
-py -3 train_ram_optimizer_model.py
-```
-
-Model output:
-
-```text
-ram_optimizer_model.pkl
-```
-
 ## 📊 Benchmark Results
-
-[`generate_charts.py`](generate_charts.py) uses Matplotlib and NumPy to create
-FPS comparison and frame-pacing outlier charts:
-
-```powershell
-py -3 generate_charts.py
-```
 
 The charts used in this README are stored in `docs/`:
 
