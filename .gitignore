@@ -2,6 +2,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Native and packaged build output.
+build/
+build_exe_deneme/
+dist/
+exe_deneme/
+*.dll
+*.pyd
+*.exe
+
 # Personal AI models and telemetry generated during local training.
 *.pkl
 *.joblib
@@ -15,3 +24,14 @@ ram_optimizer_model.pkl
 test_*.db
 test_*.json
 test_*.log
+
+# IDE and operating-system files.
+.vscode/
+.idea/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db
+*.log
